@@ -22,7 +22,17 @@ VERDICT_COLORS = {
 def _card_html(l: Listing) -> str:
     verdict = l.verdict or "mixed"
     color = VERDICT_COLORS.get(verdict, "#6b7280")
-    price_str = f"${l.price:,}" if l.price else "—"
+    pt = getattr(l, "price_type", "asking") or "asking"
+    pt_label = {"bid": "Current bid", "sold": "Sold for", "auction": "Auction"}.get(pt, "Asking")
+    pt_badge = ""
+    if pt != "asking":
+        badge_colors = {"bid": "#7c3aed", "sold": "#64748b", "auction": "#0891b2"}
+        pt_badge = (
+            f'<span style="display:inline-block;background:{badge_colors.get(pt, "#334155")};'
+            f'color:white;font-size:9px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;'
+            f'padding:1px 5px;border-radius:3px;margin-left:6px;">{pt.upper()}</span>'
+        )
+    price_str = (f"${l.price:,}" if l.price else "—") + pt_badge
     all_in_str = f"${l.all_in_price:,}" if l.all_in_price else "—"
     ac = f"${l.ac_estimate_usd:,}" if l.ac_estimate_usd else ("Works" if l.ac_estimate_usd == 0 else "—")
     miles = f"{l.mileage:,} mi" if l.mileage else "—"
@@ -45,7 +55,7 @@ def _card_html(l: Listing) -> str:
         {f' · <span>{int(l.distance_miles)} mi from you</span>' if l.distance_miles else ''}
       </div>
       <div class="prices">
-        <div><span class="label">Asking</span><span class="value">{price_str}</span></div>
+        <div><span class="label">{pt_label}</span><span class="value">{price_str}</span></div>
         <div><span class="label">A/C work</span><span class="value">{ac}</span></div>
         <div><span class="label">All-in</span><span class="value">{all_in_str}</span></div>
       </div>

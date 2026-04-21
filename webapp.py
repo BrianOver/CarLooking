@@ -187,6 +187,16 @@ TEMPLATE = r"""<!doctype html>
   .prices .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; display: block; }
   .prices .value { font-weight: 600; font-size: 15px; }
 
+  .price-type {
+    display: inline-block; font-size: 9px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; padding: 1px 5px; border-radius: 3px; margin-left: 4px;
+    vertical-align: middle; position: relative; top: -1px;
+  }
+  .pt-bid { background: #7c3aed; color: white; }
+  .pt-sold { background: #64748b; color: white; }
+  .pt-asking { background: #334155; color: #cbd5e1; }
+  .pt-auction { background: #0891b2; color: white; }
+
   /* Modal */
   .modal-bg {
     position: fixed; inset: 0; background: rgba(0,0,0,0.65);
@@ -226,6 +236,7 @@ TEMPLATE = r"""<!doctype html>
   <input type="search" id="q" placeholder="Search title, model, location…">
   <select id="sort">
     <option value="score">Best match</option>
+    <option value="distance_asc">Distance ↑ (closest)</option>
     <option value="allin_asc">All-in price ↑</option>
     <option value="price_asc">Price ↑</option>
     <option value="price_desc">Price ↓</option>
@@ -297,6 +308,18 @@ const state = {
 
 function money(n) { return n == null ? "—" : "$" + n.toLocaleString(); }
 function num(n) { return n == null ? "—" : n.toLocaleString(); }
+
+function priceTypeLabel(pt) {
+  return ({
+    "bid": "Current bid", "sold": "Sold for", "auction": "Auction",
+  })[pt] || "Asking";
+}
+function priceTypeBadge(pt) {
+  if (!pt || pt === "asking") return "";
+  const cls = "pt-" + pt;
+  const txt = pt === "bid" ? "BID" : pt === "sold" ? "SOLD" : pt === "auction" ? "AUCTION" : pt.toUpperCase();
+  return `<span class="price-type ${cls}">${txt}</span>`;
+}
 
 async function load() {
   const r = await fetch("/api/listings");
@@ -377,6 +400,7 @@ function filterAndSort() {
 
   const cmpNum = (a, b, def) => (a ?? def) - (b ?? def);
   switch (state.sort) {
+    case "distance_asc": out.sort((a,b)=>cmpNum(a.distance_miles, b.distance_miles, 1e9)); break;
     case "allin_asc": out.sort((a,b)=>cmpNum(a.all_in_price ?? a.price, b.all_in_price ?? b.price, 1e9)); break;
     case "price_asc": out.sort((a,b)=>cmpNum(a.price, b.price, 1e9)); break;
     case "price_desc": out.sort((a,b)=>cmpNum(b.price, a.price, -1)); break;
@@ -415,7 +439,7 @@ function render() {
         ${l.distance_miles ? `<span>${Math.round(l.distance_miles)} mi away</span>` : ""}
       </div>
       <div class="prices">
-        <div class="box"><span class="label">Asking</span><span class="value">${money(l.price)}</span></div>
+        <div class="box"><span class="label">${priceTypeLabel(l.price_type)}</span><span class="value">${money(l.price)}${priceTypeBadge(l.price_type)}</span></div>
         <div class="box"><span class="label">A/C work</span><span class="value">${l.ac_estimate_usd == null ? "—" : (l.ac_estimate_usd === 0 ? "Works" : money(l.ac_estimate_usd))}</span></div>
         <div class="box"><span class="label">All-in</span><span class="value">${money(l.all_in_price)}</span></div>
       </div>`;
@@ -435,7 +459,7 @@ function openModal(l) {
     </div>
     <h2>${escapeHTML(l.title||"")}</h2>
     <div class="grid2">
-      <div class="item"><span class="k">Asking</span><span class="v">${money(l.price)}</span></div>
+      <div class="item"><span class="k">${priceTypeLabel(l.price_type)}</span><span class="v">${money(l.price)}${priceTypeBadge(l.price_type)}</span></div>
       <div class="item"><span class="k">A/C retrofit</span><span class="v">${l.ac_estimate_usd == null ? "—" : (l.ac_estimate_usd === 0 ? "Works as-listed" : money(l.ac_estimate_usd))}</span></div>
       <div class="item"><span class="k">All-in</span><span class="v">${money(l.all_in_price)}</span></div>
       <div class="item"><span class="k">Year / Make / Model</span><span class="v">${[l.year, l.make, l.model].filter(Boolean).join(" ") || "—"}</span></div>

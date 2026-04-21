@@ -78,6 +78,7 @@ def _parse_search_page(html: str) -> list[Listing]:
             url=url,
             title=title,
             price=price,
+            price_type="bid",
             year=year,
         ))
 
@@ -111,6 +112,7 @@ def _listings_from_next_data(data: dict) -> list[Listing]:
                     url=url,
                     title=str(title),
                     price=price,
+                    price_type="bid",
                     year=parse_year(str(title)),
                     raw_id=str(slug),
                 ))

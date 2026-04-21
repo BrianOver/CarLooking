@@ -4,6 +4,16 @@ Scrapes public used-car listings for **manual weekend cars** near Sachse, TX and
 
 Comes with a **local web UI** for filtering, sorting, and browsing the results — see [Web UI](#web-ui) below.
 
+## Quick start
+
+```bash
+pip install -r requirements.txt
+python main.py            # scrape + score (takes ~3 min)
+python webapp.py          # local UI at http://127.0.0.1:5173/
+```
+
+That's it. The UI lets you sort by distance / price / year, filter by verdict / source / budget / mileage, and click into any listing for full details + a link to the original.
+
 ## Sources
 
 Tested against live sites, DFW radius, manual filter:
@@ -88,13 +98,69 @@ python webapp.py
 ```
 
 Features:
-- **Grid view** of scored listings, sortable by best-match, all-in price, price, year, or mileage
+- **Grid view** of scored listings, sortable by best-match, **distance (closest)**, all-in price, price, year, or mileage
 - **Live search** across title, model, location, and description
 - **Sidebar filters**: verdict, source, min score, price range, year range, max mileage
+- **Price type badges** — every listing shows whether the number is an `ASKING` price, current `BID`, or `SOLD` final price. Lets you spot auction listings (BaT, C&B) at a glance so you don't confuse an opening bid with a real asking price.
 - Click any card → **details modal** with full concerns/benefits + direct link to the listing
 - **Refresh data** button kicks off a fresh scrape in the background and auto-reloads the grid when done
 
 All filtering happens in the browser — the page loads the JSON file once on startup and never hits the network except for refresh.
+
+## Price type (bid vs asking)
+
+Each listing carries a `price_type`:
+
+| Value | Meaning | Where it comes from |
+|---|---|---|
+| `asking` | A fixed asking price from a seller | Craigslist, eBay Motors, AutoTrader, Cars.com, ClassicCars, Hemmings |
+| `bid` | Current high bid in an active auction (will climb) | Bring a Trailer active auctions, Cars & Bids |
+| `sold` | Final hammer price — auction already ended | Bring a Trailer / Cars & Bids completed auctions |
+| `auction` | eBay auction listing (distinct from BIN) | reserved for future eBay auction detection |
+
+This matters a lot: a BaT listing showing `$3,900 [BID]` with 2 days to go will probably end at $8–12K. Don't get excited by opening-bid prices.
+
+## Handoff / picking this up later
+
+For future-you or another Claude instance working on this repo:
+
+**Project layout**
+- [main.py](main.py) — CLI entry (`python main.py` runs all enabled scrapers, scores, writes `output/`)
+- [webapp.py](webapp.py) — Flask UI, self-contained (HTML/CSS/JS inlined in the template string)
+- [config.yaml](config.yaml) — budget, zip, radius, target model list, source toggles, red/green flags
+- [src/models.py](src/models.py) — `Listing` dataclass (the shared data structure)
+- [src/analyzer.py](src/analyzer.py) — scoring heuristic + optional Claude Haiku enrichment
+- [src/ac_estimator.py](src/ac_estimator.py) — Texas A/C retrofit cost heuristic
+- [src/report.py](src/report.py) — static HTML report + Rich console table
+- [src/scrapers/base.py](src/scrapers/base.py) — shared HTTP client (uses `curl_cffi` for Chrome TLS impersonation — critical for bypassing Cloudflare on eBay/AutoTrader/etc.), shared parsers (`parse_price`, `parse_year`, `parse_mileage`, `detect_transmission`, `title_matches_model`)
+- [src/scrapers/*.py](src/scrapers/) — one file per site; each exposes a `scrape(criteria, target_models) -> list[Listing]` function; registered in [src/scrapers/\_\_init\_\_.py](src/scrapers/__init__.py)
+
+**Key design decisions**
+- **`curl_cffi` for HTTP**: plain `requests` gets 403'd by Cloudflare on most car sites. `curl_cffi` with `impersonate="chrome124"` does real Chrome TLS fingerprinting and gets past. If a site starts blocking again, try a different `impersonate=` value.
+- **Scrapers are independent**: one crash won't kill the run. Each is wrapped in try/except in [main.py](main.py).
+- **Client-side model filter**: sites like BaT and ClassicCars ignore their own search params. We fetch the full page and match titles against `target_models` locally via `title_matches_model()`. That function guards against generic words like "Roadster" / "Spider" matching every car by requiring the full "Make Model" phrase in those cases.
+- **BaT non-car filter**: BaT's bootstrap items include automobilia (wheels, signs, hardtops). We skip any item whose `categories` contains `"379"` or `"380"`.
+- **BaT location enrichment**: bootstrap JSON only gives country + lat/lon. For city/state we fetch each matched detail page (capped at ~60/run) and regex out `<strong>Location</strong>: <a>City, State ZIP</a>` from the essentials section.
+- **Output is gitignored**: `output/listings.json` + `output/report.html` contain seller PII (names, phone numbers, addresses sometimes). Do not commit. The public GitHub repo is https://github.com/BrianOver/CarLooking.
+- **Git identity scoped to this repo**: `user.email = howlb73@gmail.com`, `user.name = BrianOver`. Set locally, not globally, so it doesn't bleed into Fornida work repos.
+
+**Known gaps + future work**
+- **AutoTrader rate-limits us** after ~10 requests. Current scraper just tries and logs the 403s. Best fix: wire Playwright with a real Chromium session (or rotate residential proxies, which is overkill for this).
+- **Cars.com / Cars & Bids / Facebook Marketplace / CarGurus** all need Playwright. Scraper files exist as stubs ready to be upgraded when someone adds that dependency.
+- **Hemmings**: search page is behind a Cloudflare JS challenge so URL discovery returns 0. Detail-page parsing works — if URLs can be obtained another way (sitemap, RSS feed if one exists, Playwright), the detail scraper is ready.
+- **No persistent storage of seen listings**: every run is a full snapshot. A future "diff mode" could email the top new listings since last run.
+- **No image display in web UI**: `Listing.images` is populated for Craigslist but the UI doesn't render thumbnails yet. Low-hanging addition.
+- **ClassicCars pagination loops**: their search ignores pagination, so we only fetch page 1. Enable manually via `config.yaml` if budget stretches to ~$40K.
+
+**To add a new scraper**
+1. Create `src/scrapers/<name>.py` with a `scrape(criteria: dict, target_models: list[str]) -> list[Listing]` function
+2. Register in `src/scrapers/__init__.py` (`REGISTRY` dict)
+3. Add to `config.yaml` under `sources:` (default to `true`/`false`)
+4. Use `make_session()` and `polite_get()` from `base.py` — they handle curl_cffi + rate-limiting
+5. Use `title_matches_model()` if the site doesn't honor its own search filters
+6. Set `price_type="bid"` / `"asking"` / `"sold"` as appropriate on each Listing
+
+**To change criteria**: just edit `config.yaml` — budget, zip, radius, target model list, red/green flags. No code changes needed.
 
 ## How scoring works
 

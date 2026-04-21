@@ -10,6 +10,7 @@ class Listing:
     url: str
     title: str
     price: Optional[int] = None
+    price_type: str = "asking"           # "asking" | "bid" | "sold" | "auction"
     year: Optional[int] = None
     make: Optional[str] = None
     model: Optional[str] = None

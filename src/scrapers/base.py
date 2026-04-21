@@ -153,3 +153,27 @@ def detect_transmission(text: str) -> Optional[str]:
 
 def build_keyword_query(models: list[str]) -> str:
     return " ".join(m.split()[-1] for m in models[:6])
+
+
+# Generic last-token words that would false-positive if matched alone.
+# e.g. "Datsun Roadster" shouldn't match a "Ford Roadster" title.
+_GENERIC_MODEL_WORDS = {
+    "roadster", "spider", "spyder", "coupe", "convertible", "cabriolet",
+    "gt", "gti", "si", "r", "m", "s", "t", "e", "z",
+}
+
+
+def title_matches_model(title: str, model: str) -> bool:
+    """Robust model-match: require full 'make model' phrase when the model's
+    last token is too generic (Roadster, Spider, GT, etc.)."""
+    if not title or not model:
+        return False
+    t = title.lower()
+    m = model.lower()
+    toks = m.split()
+    last = toks[-1]
+    if last in _GENERIC_MODEL_WORDS or len(last) <= 2:
+        # Require the full phrase to appear
+        return m in t
+    # Otherwise the distinctive last token is enough
+    return last in t

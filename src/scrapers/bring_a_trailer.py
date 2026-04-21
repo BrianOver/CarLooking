@@ -1,17 +1,28 @@
 """
 Bring a Trailer scraper.
 
-BaT's search is reachable at:
-  https://bringatrailer.com/auctions/?search=<keyword>
+BaT ignores the anon `?search=` query param; the public /auctions/ page
+always returns every active auction. We fetch it once, filter the bootstrap
+JSON client-side by target model match, then enrich each match with a quick
+detail-page fetch to get the seller's city/state.
 
-Listings live at /listing/<slug>/. BaT is nationwide and auction-based.
-Bids on desirable weekend cars often exceed our budget, but there are
-no-reserve ones and less-hyped models that land under $23K.
+Key fields in BaT's bootstrap items:
+  - title, url, year, era
+  - current_bid (int), current_bid_formatted, current_bid_label ("Bid:" | "Sold for:")
+  - sold_text  ("" while active, e.g. "Sold for $X" when finished)
+  - categories (list of numeric IDs) — category 379 = automobilia/parts/wheels/signs
+  - lat, lon  (seller coordinates)
+  - country, country_code
+  - excerpt   (short description)
+
+Non-car filter: any listing whose categories contains "379" is an accessory
+(hardtops, wheels, neon signs, etc.) and gets skipped.
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from typing import Optional
 from urllib.parse import urlencode
@@ -19,21 +30,40 @@ from urllib.parse import urlencode
 from bs4 import BeautifulSoup
 
 from ..models import Listing
-from .base import make_session, polite_get, parse_price, parse_year, parse_mileage
+from .base import (
+    make_session, polite_get, parse_price, parse_year, parse_mileage,
+    detect_transmission, title_matches_model,
+)
 
 log = logging.getLogger(__name__)
 
 BASE = "https://bringatrailer.com/auctions/"
 
+# Sachse, TX
+SACHSE_LAT = 32.9762
+SACHSE_LON = -96.5952
 
-def _build_url(query: str) -> str:
-    return f"{BASE}?{urlencode({'search': query})}"
+# BaT category IDs for non-car items (Automobilia/Parts)
+NONCAR_CATEGORIES = {"379", "380"}
+
+# Per-run detail fetch cap to keep requests bounded
+DETAIL_FETCH_CAP = 60
+
+
+def _build_url(query: str = "") -> str:
+    return f"{BASE}?{urlencode({'search': query})}" if query else BASE
+
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 3958.8
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
 
 
 def _extract_balanced_json(text: str, start_idx: int) -> Optional[str]:
-    """Starting from an opening '{' at start_idx, return the matching {...}
-    substring. Crude but good enough for these bootstrap blobs (no embedded
-    raw '{' inside strings that aren't properly escaped)."""
     if start_idx >= len(text) or text[start_idx] != "{":
         return None
     depth = 0
@@ -60,11 +90,8 @@ def _extract_balanced_json(text: str, start_idx: int) -> Optional[str]:
     return None
 
 
-def _parse_cards(html: str) -> list[Listing]:
-    out: list[Listing] = []
-
-    # BaT bootstraps data as `var auctionsCurrentInitialData = {...};` — items are
-    # inside. Match the starting point and balance braces.
+def _parse_bootstrap(html: str) -> list[dict]:
+    items: list[dict] = []
     for marker in ["auctionsCurrentInitialData", "auctionsCompletedInitialData"]:
         idx = html.find(marker)
         if idx < 0:
@@ -79,80 +106,127 @@ def _parse_cards(html: str) -> list[Listing]:
             data = json.loads(blob)
         except json.JSONDecodeError:
             continue
-        items = data.get("items") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            continue
-        out.extend(_from_bootstrap(items))
-
-    if out:
-        return out
-
-    soup = BeautifulSoup(html, "lxml")
-
-    # HTML fallback
-    for card in soup.select("div.auctions-item, .listing-card, .block-auction"):
-        link = card.find("a", href=re.compile(r"/listing/"))
-        if not link:
-            continue
-        url = link.get("href")
-        if not url:
-            continue
-        if not url.startswith("http"):
-            url = f"https://bringatrailer.com{url}"
-
-        title_el = card.select_one(".auctions-item-title, h3, .title")
-        title = title_el.get_text(strip=True) if title_el else link.get_text(strip=True)
-
-        price_el = card.select_one(".bid-value, .current-bid, .price")
-        price = parse_price(price_el.get_text(strip=True)) if price_el else None
-
-        out.append(Listing(
-            source="bring_a_trailer",
-            url=url,
-            title=title,
-            price=price,
-            year=parse_year(title),
-        ))
-    return out
+        its = data.get("items") if isinstance(data, dict) else None
+        if isinstance(its, list):
+            items.extend(its)
+    return items
 
 
-def _from_bootstrap(items: list[dict]) -> list[Listing]:
-    out = []
-    for item in items:
-        url = item.get("url") or item.get("permalink")
-        if not url:
-            continue
-        title = item.get("title") or ""
-        bid = item.get("current_bid") or item.get("current_bid_formatted") or item.get("price")
-        if isinstance(bid, dict):
-            bid = bid.get("amount") or bid.get("value")
-        price = None
-        if bid:
-            try:
-                price = int(str(bid).replace(",", "").replace("$", ""))
-            except ValueError:
-                pass
-        out.append(Listing(
-            source="bring_a_trailer",
-            url=url,
-            title=title,
-            price=price,
-            year=parse_year(title) or item.get("year"),
-            raw_id=str(item.get("id", "")) or None,
-        ))
-    return out
+def _is_car(item: dict) -> bool:
+    """Reject automobilia / parts / wheels / signs (BaT category 379/380)."""
+    cats = item.get("categories") or []
+    if not isinstance(cats, list):
+        return True
+    for c in cats:
+        if str(c) in NONCAR_CATEGORIES:
+            return False
+    # Also reject items with no year at all — those are almost always accessories
+    year = item.get("year")
+    if not year or not str(year).strip():
+        return False
+    return True
 
 
-def _title_matches_model(title: str, model: str) -> bool:
-    """BaT's `?search=` param doesn't actually filter — the page returns all
-    active auctions with JS-side filtering. We filter server-returned items
-    against the model name ourselves."""
-    t = title.lower()
-    m = model.lower()
-    # Require last token of model (e.g. "miata") to appear
-    toks = m.split()
-    needle = toks[-1] if len(toks[-1]) > 2 else " ".join(toks[-2:])
-    return needle in t
+def _item_to_listing(item: dict) -> Optional[Listing]:
+    url = item.get("url")
+    title = item.get("title") or ""
+    if not url or not title:
+        return None
+
+    year_raw = item.get("year")
+    try:
+        year = int(year_raw) if year_raw else parse_year(title)
+    except (TypeError, ValueError):
+        year = parse_year(title)
+
+    # Price + type
+    sold_text = item.get("sold_text") or ""
+    bid_label = str(item.get("current_bid_label") or "").lower()
+    current_bid = item.get("current_bid")
+    price: Optional[int] = None
+    price_type = "bid"
+    if sold_text:
+        # Completed auction — extract the final price from sold_text
+        price = parse_price(sold_text)
+        price_type = "sold"
+    elif current_bid:
+        try:
+            price = int(current_bid)
+        except (TypeError, ValueError):
+            price = parse_price(item.get("current_bid_formatted") or "")
+        price_type = "sold" if "sold" in bid_label else "bid"
+
+    # Coords + distance
+    distance = None
+    try:
+        lat = float(item.get("lat")) if item.get("lat") else None
+        lon = float(item.get("lon")) if item.get("lon") else None
+        if lat is not None and lon is not None:
+            distance = round(_haversine_miles(lat, lon, SACHSE_LAT, SACHSE_LON), 1)
+    except (TypeError, ValueError):
+        pass
+
+    # Transmission hint from title (most BaT titles include "5-Speed" / "6-Speed Manual" / "PDK" etc.)
+    trans_from_title = detect_transmission(title)
+
+    return Listing(
+        source="bring_a_trailer",
+        url=url,
+        title=title,
+        price=price,
+        price_type=price_type,
+        year=year if isinstance(year, int) else None,
+        mileage=parse_mileage(title),
+        transmission=trans_from_title,     # may be upgraded/overridden by detail page
+        location=item.get("country"),      # overridden by detail page when possible
+        distance_miles=distance,
+        description=item.get("excerpt") or "",
+        raw_id=str(item.get("id") or ""),
+    )
+
+
+# BaT wraps the location text in an anchor pointing to Google Maps, e.g.
+#   <strong>Location</strong>: <a href="...">Lancaster, Pennsylvania 17603</a>
+# There's an earlier "Located in United States" widget on the page that looks
+# similar but has no colon — the `\s*:\s*` requirement skips that one.
+LOCATION_RE = re.compile(
+    r"<strong[^>]*>Location</strong>\s*:\s*(?:<a[^>]*>)?([^<\n]+?)(?:</a|</|<br|\n)",
+    re.I,
+)
+
+
+def _enrich_from_detail(session, listing: Listing) -> None:
+    """Fetch the detail page and pull seller city + state into location.
+    Also upgrades the transmission + mileage fields where possible."""
+    resp = polite_get(session, listing.url, sleep=0.9, timeout=25)
+    if resp is None:
+        return
+    body = resp.text
+    m = LOCATION_RE.search(body)
+    if m:
+        loc = re.sub(r"\s+", " ", m.group(1)).strip()
+        # BaT strings look like "Lancaster, Pennsylvania 17603" — strip trailing ZIP
+        loc = re.sub(r"\s+\d{5}(?:-\d{4})?$", "", loc)
+        if loc:
+            listing.location = loc
+
+    # Pull transmission + mileage out of the essentials bullet list
+    soup = BeautifulSoup(body, "lxml")
+    ess = soup.select_one(".essentials, .listing-essentials, .item-specs")
+    if ess:
+        text = ess.get_text(" | ", strip=True)
+        lower = text.lower()
+        if "manual transmission" in lower or "-speed manual" in lower:
+            listing.transmission = "manual"
+        elif "automatic transmission" in lower:
+            listing.transmission = "automatic"
+
+        mi = parse_mileage(text)
+        if mi and not listing.mileage:
+            listing.mileage = mi
+
+        if not listing.description:
+            listing.description = text[:800]
 
 
 def scrape(criteria: dict, target_models: list[str]) -> list[Listing]:
@@ -161,31 +235,45 @@ def scrape(criteria: dict, target_models: list[str]) -> list[Listing]:
     max_price = criteria.get("max_price", 23000)
     manual_only = criteria.get("transmission") == "manual"
 
-    out: list[Listing] = []
-    seen_urls: set[str] = set()
-
-    # BaT ignores the search param for anon GET — one hit returns all active
-    # auctions. We fetch once, then filter client-side against target_models.
-    url = _build_url("weekend")  # query value doesn't matter
-    log.info("bat: one fetch + local filter")
+    url = _build_url()
+    log.info("bat: one fetch + local filter + detail enrich")
     resp = polite_get(session, url, sleep=1.5, timeout=25)
     if resp is None:
-        return out
+        return []
 
-    all_items = _parse_cards(resp.text)
-    for l in all_items:
-        if l.url in seen_urls:
+    raw_items = _parse_bootstrap(resp.text)
+    log.info("bat raw items: %d", len(raw_items))
+
+    # Filter: car + target model + price headroom
+    matches: list[Listing] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if not _is_car(item):
             continue
-        if l.price and l.price > max_price * 1.2:
-            continue
-        # Keep only if it matches one of our target models
-        matched = next((m for m in target_models if _title_matches_model(l.title, m)), None)
+        title = item.get("title", "")
+        matched = next((m for m in target_models if title_matches_model(title, m)), None)
         if not matched:
             continue
-        seen_urls.add(l.url)
-        l.model = matched
-        l.transmission = "manual" if manual_only else l.transmission
-        out.append(l)
+        listing = _item_to_listing(item)
+        if listing is None or listing.url in seen:
+            continue
+        if listing.price and listing.price > max_price * 1.2:
+            continue
+        seen.add(listing.url)
+        listing.model = matched
+        matches.append(listing)
 
-    log.info("bring-a-trailer total listings: %d", len(out))
-    return out
+    log.info("bat matched cars: %d — fetching details for location/trans", len(matches))
+
+    # Enrich each match with detail-page data (location, transmission). Cap
+    # to keep runs bounded. BaT tolerates ~1 req/sec comfortably.
+    for i, listing in enumerate(matches[:DETAIL_FETCH_CAP]):
+        _enrich_from_detail(session, listing)
+
+    # After enrichment, optionally drop anything clearly not manual
+    if manual_only:
+        matches = [l for l in matches if l.transmission != "automatic"]
+        # Leave unknowns in — some listings don't surface trans in essentials
+
+    log.info("bring-a-trailer total listings: %d", len(matches))
+    return matches

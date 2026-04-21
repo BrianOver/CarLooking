@@ -26,7 +26,7 @@ from urllib.parse import urlencode
 from bs4 import BeautifulSoup
 
 from ..models import Listing
-from .base import make_session, polite_get, parse_price, parse_year, parse_mileage
+from .base import make_session, polite_get, parse_price, parse_year, parse_mileage, title_matches_model
 
 log = logging.getLogger(__name__)
 
@@ -146,13 +146,6 @@ def _pair_and_normalize(cards: list[dict], ld_cars: list[dict]) -> list[Listing]
     return out
 
 
-def _title_matches_model(title: str, model: str) -> bool:
-    t = title.lower()
-    toks = model.lower().split()
-    needle = toks[-1] if len(toks[-1]) > 2 else " ".join(toks[-2:])
-    return needle in t
-
-
 def scrape(criteria: dict, target_models: list[str]) -> list[Listing]:
     session = make_session()
     session.headers.update({"Referer": "https://classiccars.com/"})
@@ -185,7 +178,7 @@ def scrape(criteria: dict, target_models: list[str]) -> list[Listing]:
             if l.price and l.price > max_price * 1.1:
                 continue
             # model filter
-            matched = next((m for m in target_models if _title_matches_model(l.title, m)), None)
+            matched = next((m for m in target_models if title_matches_model(l.title, m)), None)
             if not matched:
                 continue
             seen_urls.add(l.url)
