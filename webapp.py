@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import collections
 import json
+import logging
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -27,18 +29,13 @@ from typing import Any
 
 from flask import Flask, Response, jsonify, redirect, render_template_string, request, session
 
-# ── Optional cloud dependencies (install via requirements.txt for Azure) ────
-try:
-    from azure.storage.blob import BlobServiceClient as _BlobSvc  # type: ignore
-    _AZURE_SDK = True
-except ImportError:
-    _AZURE_SDK = False
-
 try:
     from apscheduler.schedulers.background import BackgroundScheduler as _BgScheduler  # type: ignore
     _APScheduler = True
 except ImportError:
     _APScheduler = False
+
+_log = logging.getLogger(__name__)
 
 
 def _get_local_ip() -> str:
@@ -57,19 +54,73 @@ MAIN_SCRIPT = ROOT / "main.py"
 # On Azure App Service /home persists across restarts; use it when available.
 # Azure sets WEBSITE_INSTANCE_ID; local mode just uses output/ next to this file.
 _AZURE_ENV = bool(os.environ.get("WEBSITE_INSTANCE_ID"))
-LISTINGS_FILE = Path("/home/output/listings.json") if _AZURE_ENV else ROOT / "output" / "listings.json"
-LISTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-# ── Azure Blob Storage (optional — set AZURE_STORAGE_CONNECTION_STRING) ─────
-# If set, listings.json is read/written to blob so it survives App Service
-# restarts and is accessible even if the local /home volume is recycled.
-AZURE_CONN = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
-AZURE_CONTAINER = os.environ.get("AZURE_BLOB_CONTAINER", "carlooking")
-AZURE_BLOB_NAME = "listings.json"
+# /home persists across Azure App Service restarts (Azure Files mount).
+# Local mode writes to output/ next to this file.
+_HOME = Path("/home") if _AZURE_ENV else ROOT / "output"
+_HOME.mkdir(parents=True, exist_ok=True)
+
+LISTINGS_FILE = _HOME / "listings.json"
+DB_PATH = _HOME / "carlooking.db"
 
 
-def _use_blob() -> bool:
-    return bool(AZURE_CONN and _AZURE_SDK)
+def _init_db() -> None:
+    with sqlite3.connect(str(DB_PATH)) as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS listings (
+            url TEXT PRIMARY KEY,
+            data TEXT NOT NULL,
+            scraped_at REAL DEFAULT (unixepoch())
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY, value TEXT
+        )""")
+
+
+def _load_listings() -> list[dict]:
+    try:
+        with sqlite3.connect(str(DB_PATH)) as c:
+            rows = c.execute(
+                "SELECT data FROM listings ORDER BY json_extract(data,'$.score') DESC"
+            ).fetchall()
+            if rows:
+                return [json.loads(r[0]) for r in rows]
+    except Exception as e:
+        _log.warning("DB read: %s", e)
+    # Fallback to JSON (first run before any scrape has written to DB)
+    if LISTINGS_FILE.exists():
+        try:
+            with open(LISTINGS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
+
+
+def _save_to_db(listings: list[dict]) -> None:
+    try:
+        with sqlite3.connect(str(DB_PATH)) as c:
+            c.execute("DELETE FROM listings")
+            c.executemany(
+                "INSERT OR REPLACE INTO listings (url, data) VALUES (?, ?)",
+                [(l.get("url", str(i)), json.dumps(l, ensure_ascii=False))
+                 for i, l in enumerate(listings)]
+            )
+            c.execute("INSERT OR REPLACE INTO meta VALUES ('last_scraped', ?)", [str(time.time())])
+        _log.info("Saved %d listings to SQLite", len(listings))
+    except Exception as e:
+        _log.warning("DB write: %s", e)
+
+
+def _db_mtime() -> float | None:
+    try:
+        with sqlite3.connect(str(DB_PATH)) as c:
+            row = c.execute("SELECT value FROM meta WHERE key='last_scraped'").fetchone()
+            return float(row[0]) if row else None
+    except Exception:
+        return None
+
+
+_init_db()
 
 
 # ── Auth (set CARLOOKING_PASSWORD to require login) ──────────────────────────
@@ -90,38 +141,8 @@ _scrape_log: collections.deque[str] = collections.deque(maxlen=200)
 _scrape_log_lock = threading.Lock()
 
 
-def _load_listings() -> list[dict]:
-    if _use_blob():
-        try:
-            data = (_BlobSvc.from_connection_string(AZURE_CONN)
-                    .get_blob_client(AZURE_CONTAINER, AZURE_BLOB_NAME)
-                    .download_blob().readall())
-            return json.loads(data)
-        except Exception as e:
-            import logging; logging.getLogger(__name__).warning("Blob read failed: %s", e)
-    if not LISTINGS_FILE.exists():
-        return []
-    try:
-        with open(LISTINGS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return []
 
 
-def _sync_to_blob() -> None:
-    """After a scrape, push listings.json to Azure Blob for persistence."""
-    if not _use_blob() or not LISTINGS_FILE.exists():
-        return
-    try:
-        client = _BlobSvc.from_connection_string(AZURE_CONN)
-        try:
-            client.get_container_client(AZURE_CONTAINER).create_container()
-        except Exception:
-            pass
-        with open(LISTINGS_FILE, "rb") as f:
-            client.get_blob_client(AZURE_CONTAINER, AZURE_BLOB_NAME).upload_blob(f, overwrite=True)
-    except Exception as e:
-        import logging; logging.getLogger(__name__).warning("Blob sync failed: %s", e)
 
 
 def _run_scrape():
@@ -157,7 +178,12 @@ def _run_scrape():
     finally:
         _scrape_state["running"] = False
         _scrape_state["last_finished"] = time.time()
-        _sync_to_blob()
+        if LISTINGS_FILE.exists():
+            try:
+                with open(LISTINGS_FILE, encoding="utf-8") as f:
+                    _save_to_db(json.load(f))
+            except Exception as e:
+                _log.warning("Post-scrape DB import: %s", e)
 
 
 @app.get("/")
@@ -173,17 +199,7 @@ def api_listings():
 @app.get("/api/status")
 def api_status():
     listings = _load_listings()
-    mtime = None
-    if _use_blob():
-        try:
-            props = (_BlobSvc.from_connection_string(AZURE_CONN)
-                     .get_blob_client(AZURE_CONTAINER, AZURE_BLOB_NAME)
-                     .get_blob_properties())
-            mtime = props.last_modified.timestamp() if props.last_modified else None
-        except Exception:
-            pass
-    elif LISTINGS_FILE.exists():
-        mtime = LISTINGS_FILE.stat().st_mtime
+    mtime = _db_mtime() or (LISTINGS_FILE.stat().st_mtime if LISTINGS_FILE.exists() else None)
     return jsonify({
         "count": len(listings),
         "data_mtime": mtime,
@@ -403,7 +419,7 @@ def pwa_icon():
 
 
 _SERVICE_WORKER_JS = r"""
-const CACHE = 'carlooking-v2';
+const CACHE = 'carlooking-v3';
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.add('/')));
@@ -613,51 +629,73 @@ TEMPLATE = r"""<!doctype html>
   .empty { color: var(--muted); text-align: center; padding: 60px 20px; font-size: 14px; }
 
   /* ── Mobile ─────────────────────────────────────────────────────────────── */
-  @media (max-width: 640px) {
-    header { padding: 10px 14px; gap: 8px; }
-    header h1 { font-size: 16px; }
-    header .stats { order: 10; width: 100%; margin-right: 0; font-size: 11px; }
-    header input[type=search] { min-width: unset; flex: 1; font-size: 16px; }
-    header select { flex: 1; font-size: 16px; }
-    header button { padding: 8px 12px; font-size: 13px; }
-    .filter-btn { display: inline-flex !important; }
+  @media (max-width: 700px) {
+    /* Header: 3-row layout using flex order
+       Row 1: [CarLooking] ............. [Filters] [⚙]
+       Row 2: [search bar — full width          ]
+       Row 3: [sort ▾] [Refresh]
+       Row 4: [stats line]                              */
+    header {
+      padding: 10px 14px; gap: 6px 8px; flex-wrap: wrap; align-items: center;
+    }
+    header h1        { order: 1; flex: 0 0 auto; font-size: 15px; }
+    .filter-btn      { order: 2; display: inline-flex !important; margin-left: auto; padding: 7px 12px; }
+    header a[href="/change-password"] { order: 3; flex: 0 0 auto; font-size: 20px; padding: 4px 2px; }
+    header input[type=search] {
+      order: 10; flex: 1 1 100%; min-width: 0;
+      font-size: 16px; /* prevents iOS zoom */
+    }
+    header select    { order: 11; flex: 1 1 0; min-width: 0; font-size: 16px; }
+    button#refresh   { order: 12; flex: 0 0 auto; font-size: 13px; padding: 8px 12px; }
+    button#reload    { display: none; }
+    header .stats    { order: 99; width: 100%; margin-right: 0; font-size: 11px; }
 
+    /* Sidebar: full-height slide-in drawer */
     .layout { grid-template-columns: 1fr; }
     aside.filters {
-      position: fixed; top: 0; left: 0; bottom: 0; width: min(300px, 88vw);
-      z-index: 60; border-right: 1px solid var(--border);
-      transform: translateX(-105%); transition: transform 0.22s ease;
-      padding-top: 54px; max-height: 100vh;
+      position: fixed; top: 0; left: 0; bottom: 0;
+      width: min(290px, 85vw); z-index: 60;
+      background: var(--panel-2); border-right: 1px solid var(--border);
+      padding: 56px 18px 24px; overflow-y: auto;
+      transform: translateX(-110%); transition: transform 0.22s ease;
+      max-height: 100vh;
     }
-    aside.filters.open { transform: translateX(0); box-shadow: 4px 0 24px rgba(0,0,0,0.5); }
+    aside.filters.open { transform: translateX(0); box-shadow: 6px 0 28px rgba(0,0,0,0.55); }
     .filter-close-btn {
-      display: flex !important; position: absolute; top: 12px; right: 12px;
-      background: none; border: none; color: var(--muted); font-size: 22px;
-      cursor: pointer; padding: 4px;
+      display: flex !important; position: absolute; top: 14px; right: 14px;
+      background: none; border: none; color: var(--muted); font-size: 24px;
+      cursor: pointer; line-height: 1; padding: 4px 6px;
     }
     .filter-backdrop {
       display: none; position: fixed; inset: 0; z-index: 59;
-      background: rgba(0,0,0,0.55); backdrop-filter: blur(2px);
+      background: rgba(0,0,0,0.6);
     }
     .filter-backdrop.open { display: block; }
 
+    /* Content */
     main { padding: 10px 12px; }
     .grid { grid-template-columns: 1fr; gap: 10px; }
-    .card-img, .card-img-placeholder { height: 180px; }
+    .card-img, .card-img-placeholder { height: 170px; }
+    .card-body { padding: 12px 14px; gap: 6px; }
 
+    /* Modal: bottom sheet */
     .modal-bg { align-items: flex-end; padding: 0; }
     .modal {
       border-radius: 18px 18px 0 0; max-width: 100%; width: 100%;
-      max-height: 88vh; padding: 18px 16px 28px;
+      max-height: 86vh; padding: 20px 16px 32px; overflow-y: auto;
     }
     .modal h2 { font-size: 16px; }
-    .modal .grid2 { grid-template-columns: 1fr; gap: 10px 0; }
-    .modal-gallery img { height: 160px; }
+    .modal .grid2 { grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+    .modal-gallery img { height: 150px; }
+    .modal .actions { flex-wrap: wrap; }
+    .modal .actions a, .modal .actions button { flex: 1; text-align: center; }
 
-    .progress-panel { width: calc(100vw - 24px); right: 12px; bottom: 12px; max-height: 50vh; }
+    /* Progress panel */
+    .progress-panel { width: calc(100vw - 24px); right: 12px; bottom: 12px; max-height: 48vh; }
 
-    .prices { gap: 8px; }
-    .prices .value { font-size: 13px; }
+    /* Price row */
+    .prices { gap: 6px; flex-wrap: wrap; }
+    .prices .box { min-width: 80px; }
   }
 
   /* Scrape progress panel */
