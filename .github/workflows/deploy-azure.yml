@@ -3,7 +3,7 @@ name: Deploy to Azure App Service
 on:
   push:
     branches: [main]
-  workflow_dispatch:   # allow manual trigger from GitHub Actions tab
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -16,11 +16,22 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v3
+      - name: Log in to Azure
+        uses: azure/login@v2
         with:
-          app-name: ${{ secrets.AZURE_WEBAPP_NAME }}
-          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure App Service
+        run: |
+          zip -r deploy.zip . \
+            --exclude "*.git*" \
+            --exclude ".venv/*" \
+            --exclude "output/*" \
+            --exclude "__pycache__/*" \
+            --exclude "*.pyc"
+          az webapp deploy \
+            --name ${{ secrets.AZURE_WEBAPP_NAME }} \
+            --resource-group carlooking-rg \
+            --src-path deploy.zip \
+            --type zip \
+            --async false
