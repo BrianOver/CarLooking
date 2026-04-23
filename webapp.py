@@ -72,7 +72,7 @@ def _init_db() -> None:
         c.execute("""CREATE TABLE IF NOT EXISTS listings (
             url TEXT PRIMARY KEY,
             data TEXT NOT NULL,
-            scraped_at REAL DEFAULT (unixepoch())
+            scraped_at REAL DEFAULT 0
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY, value TEXT
@@ -105,9 +105,10 @@ def _save_to_db(listings: list[dict]) -> int:
         c.execute("PRAGMA journal_mode=DELETE")   # WAL has issues on Azure Files
         c.execute("PRAGMA synchronous=FULL")
         c.execute("DELETE FROM listings")
+        now = time.time()
         c.executemany(
-            "INSERT OR REPLACE INTO listings (url, data) VALUES (?, ?)",
-            [(l.get("url", str(i)), json.dumps(l, ensure_ascii=False))
+            "INSERT OR REPLACE INTO listings (url, data, scraped_at) VALUES (?, ?, ?)",
+            [(l.get("url", str(i)), json.dumps(l, ensure_ascii=False), now)
              for i, l in enumerate(listings)]
         )
         c.execute("INSERT OR REPLACE INTO meta VALUES ('last_scraped', ?)", [str(time.time())])
