@@ -14,6 +14,7 @@ Features:
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import subprocess
@@ -23,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request
 
 ROOT = Path(__file__).parent
 LISTINGS_FILE = ROOT / "output" / "listings.json"
@@ -31,9 +32,13 @@ MAIN_SCRIPT = ROOT / "main.py"
 
 app = Flask(__name__)
 
-# Lock protecting concurrent rescrape triggers
 _scrape_lock = threading.Lock()
-_scrape_state: dict[str, Any] = {"running": False, "started_at": None, "last_finished": None, "last_error": None}
+_scrape_state: dict[str, Any] = {
+    "running": False, "started_at": None, "last_finished": None, "last_error": None,
+}
+# Rolling log of the last 200 lines from the most recent scrape run
+_scrape_log: collections.deque[str] = collections.deque(maxlen=200)
+_scrape_log_lock = threading.Lock()
 
 
 def _load_listings() -> list[dict]:
@@ -50,21 +55,32 @@ def _run_scrape():
     _scrape_state["running"] = True
     _scrape_state["started_at"] = time.time()
     _scrape_state["last_error"] = None
+    with _scrape_log_lock:
+        _scrape_log.clear()
     try:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
-        proc = subprocess.run(
-            [sys.executable, str(MAIN_SCRIPT)],
+        proc = subprocess.Popen(
+            [sys.executable, "-u", str(MAIN_SCRIPT)],
             cwd=str(ROOT),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             env=env,
-            timeout=1800,
         )
+        for line in proc.stdout:
+            line = line.rstrip()
+            with _scrape_log_lock:
+                _scrape_log.append(line)
+        proc.wait(timeout=1800)
         if proc.returncode != 0:
-            _scrape_state["last_error"] = (proc.stderr or proc.stdout)[-400:]
+            with _scrape_log_lock:
+                last = list(_scrape_log)[-5:]
+            _scrape_state["last_error"] = "\n".join(last)
     except Exception as e:
-        _scrape_state["last_error"] = str(e)[-400:]
+        _scrape_state["last_error"] = str(e)[:400]
+        with _scrape_log_lock:
+            _scrape_log.append(f"ERROR: {e}")
     finally:
         _scrape_state["running"] = False
         _scrape_state["last_finished"] = time.time()
@@ -89,6 +105,25 @@ def api_status():
         "data_mtime": mtime,
         "scrape": _scrape_state,
     })
+
+
+@app.get("/api/refresh/log")
+def api_refresh_log():
+    """Returns the current scrape log as SSE stream, then closes."""
+    def generate():
+        sent = 0
+        while True:
+            with _scrape_log_lock:
+                lines = list(_scrape_log)
+            for line in lines[sent:]:
+                yield f"data: {json.dumps(line)}\n\n"
+            sent = len(lines)
+            if not _scrape_state["running"]:
+                yield "data: {\"__done__\": true}\n\n"
+                break
+            time.sleep(0.4)
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/refresh")
@@ -250,6 +285,41 @@ TEMPLATE = r"""<!doctype html>
   .modal .actions button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
 
   .empty { color: var(--muted); text-align: center; padding: 60px 20px; font-size: 14px; }
+
+  /* Scrape progress panel */
+  .progress-panel {
+    display: none; position: fixed; bottom: 20px; right: 20px; z-index: 200;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+    width: 420px; max-height: 320px; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    flex-direction: column; overflow: hidden;
+  }
+  .progress-panel.active { display: flex; }
+  .progress-header {
+    display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+    border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 600;
+  }
+  .progress-header .spinner {
+    width: 12px; height: 12px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%;
+    animation: spin 0.7s linear infinite; flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .progress-header .close-btn {
+    margin-left: auto; background: none; border: none; color: var(--muted);
+    cursor: pointer; font-size: 16px; padding: 0 2px; line-height: 1;
+  }
+  .progress-log {
+    flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 11px;
+    font-family: "Consolas", "Menlo", monospace; color: var(--muted);
+    scroll-behavior: smooth;
+  }
+  .progress-log .log-line { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
+  .progress-log .log-line.highlight { color: var(--text); }
+  .progress-log .log-line.error { color: #f87171; }
+  .progress-done {
+    padding: 8px 14px; border-top: 1px solid var(--border); font-size: 12px;
+    color: var(--green); display: none;
+  }
 </style>
 </head>
 <body>
@@ -306,6 +376,16 @@ TEMPLATE = r"""<!doctype html>
     <div id="grid" class="grid"></div>
     <div id="empty" class="empty" style="display:none;">No listings match your filters.</div>
   </main>
+</div>
+
+<div class="progress-panel" id="progressPanel">
+  <div class="progress-header">
+    <div class="spinner" id="progressSpinner"></div>
+    <span id="progressTitle">Scraping…</span>
+    <button class="close-btn" onclick="document.getElementById('progressPanel').classList.remove('active')" title="Hide (scrape still running)">×</button>
+  </div>
+  <div class="progress-log" id="progressLog"></div>
+  <div class="progress-done" id="progressDone">Done — reloading listings…</div>
 </div>
 
 <div class="modal-bg" id="modalBg">
@@ -552,22 +632,63 @@ document.getElementById("clearFilters").addEventListener("click", () => {
 });
 
 document.getElementById("reload").addEventListener("click", load);
-document.getElementById("refresh").addEventListener("click", async () => {
+document.getElementById("refresh").addEventListener("click", startRefresh);
+
+async function startRefresh() {
   const btn = document.getElementById("refresh");
   btn.disabled = true;
+
   const r = await fetch("/api/refresh", { method: "POST" });
   if (!r.ok) {
-    alert("Refresh failed: " + (await r.text()));
+    const body = await r.text().catch(() => "");
+    alert("Refresh failed: " + body);
     btn.disabled = false;
     return;
   }
-  setTimeout(updateStats, 500);
-  // Reload listings when scrape finishes
-  const poll = setInterval(async () => {
-    const st = await (await fetch("/api/status")).json();
-    if (!st.scrape?.running) { clearInterval(poll); await load(); }
-  }, 4000);
-});
+
+  // Show progress panel
+  const panel = document.getElementById("progressPanel");
+  const log = document.getElementById("progressLog");
+  const done = document.getElementById("progressDone");
+  const title = document.getElementById("progressTitle");
+  const spinner = document.getElementById("progressSpinner");
+  log.innerHTML = "";
+  done.style.display = "none";
+  spinner.style.display = "block";
+  title.textContent = "Scraping…";
+  panel.classList.add("active");
+
+  // Connect SSE stream for live log lines
+  const es = new EventSource("/api/refresh/log");
+  es.onmessage = (e) => {
+    let parsed;
+    try { parsed = JSON.parse(e.data); } catch { return; }
+    if (parsed && parsed.__done__) {
+      es.close();
+      spinner.style.display = "none";
+      title.textContent = "Scrape complete";
+      done.style.display = "block";
+      btn.disabled = false;
+      updateStats();
+      setTimeout(() => { load(); done.style.display = "none"; }, 1200);
+      return;
+    }
+    const line = typeof parsed === "string" ? parsed : JSON.stringify(parsed);
+    const div = document.createElement("div");
+    div.className = "log-line" +
+      (line.startsWith("  >") || line.startsWith("[CarLooking]") ? " highlight" : "") +
+      (line.startsWith("ERROR") || line.includes("crashed") ? " error" : "");
+    div.textContent = line;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  };
+  es.onerror = () => {
+    es.close();
+    btn.disabled = false;
+    spinner.style.display = "none";
+    title.textContent = "Scrape error — check log";
+  };
+}
 
 function escapeHTML(s) {
   return String(s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
