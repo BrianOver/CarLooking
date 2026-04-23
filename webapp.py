@@ -25,7 +25,20 @@ import time
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, redirect, render_template_string, request, session
+
+# ── Optional cloud dependencies (install via requirements.txt for Azure) ────
+try:
+    from azure.storage.blob import BlobServiceClient as _BlobSvc  # type: ignore
+    _AZURE_SDK = True
+except ImportError:
+    _AZURE_SDK = False
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler as _BgScheduler  # type: ignore
+    _APScheduler = True
+except ImportError:
+    _APScheduler = False
 
 
 def _get_local_ip() -> str:
@@ -39,10 +52,34 @@ def _get_local_ip() -> str:
         return "unknown"
 
 ROOT = Path(__file__).parent
-LISTINGS_FILE = ROOT / "output" / "listings.json"
 MAIN_SCRIPT = ROOT / "main.py"
 
+# On Azure App Service /home persists across restarts; use it when available.
+# Azure sets WEBSITE_INSTANCE_ID; local mode just uses output/ next to this file.
+_AZURE_ENV = bool(os.environ.get("WEBSITE_INSTANCE_ID"))
+LISTINGS_FILE = Path("/home/output/listings.json") if _AZURE_ENV else ROOT / "output" / "listings.json"
+LISTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+# ── Azure Blob Storage (optional — set AZURE_STORAGE_CONNECTION_STRING) ─────
+# If set, listings.json is read/written to blob so it survives App Service
+# restarts and is accessible even if the local /home volume is recycled.
+AZURE_CONN = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
+AZURE_CONTAINER = os.environ.get("AZURE_BLOB_CONTAINER", "carlooking")
+AZURE_BLOB_NAME = "listings.json"
+
+
+def _use_blob() -> bool:
+    return bool(AZURE_CONN and _AZURE_SDK)
+
+
+# ── Auth (set CARLOOKING_PASSWORD to require login) ──────────────────────────
+_PASSWORD = os.environ.get("CARLOOKING_PASSWORD", "")
+
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24).hex()
+
+# ── Auto-scrape scheduler (set SCRAPE_INTERVAL_HOURS, e.g. 12) ───────────────
+_SCRAPE_INTERVAL_HOURS = int(os.environ.get("SCRAPE_INTERVAL_HOURS", "0"))
 
 _scrape_lock = threading.Lock()
 _scrape_state: dict[str, Any] = {
@@ -54,6 +91,14 @@ _scrape_log_lock = threading.Lock()
 
 
 def _load_listings() -> list[dict]:
+    if _use_blob():
+        try:
+            data = (_BlobSvc.from_connection_string(AZURE_CONN)
+                    .get_blob_client(AZURE_CONTAINER, AZURE_BLOB_NAME)
+                    .download_blob().readall())
+            return json.loads(data)
+        except Exception as e:
+            import logging; logging.getLogger(__name__).warning("Blob read failed: %s", e)
     if not LISTINGS_FILE.exists():
         return []
     try:
@@ -61,6 +106,22 @@ def _load_listings() -> list[dict]:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return []
+
+
+def _sync_to_blob() -> None:
+    """After a scrape, push listings.json to Azure Blob for persistence."""
+    if not _use_blob() or not LISTINGS_FILE.exists():
+        return
+    try:
+        client = _BlobSvc.from_connection_string(AZURE_CONN)
+        try:
+            client.get_container_client(AZURE_CONTAINER).create_container()
+        except Exception:
+            pass
+        with open(LISTINGS_FILE, "rb") as f:
+            client.get_blob_client(AZURE_CONTAINER, AZURE_BLOB_NAME).upload_blob(f, overwrite=True)
+    except Exception as e:
+        import logging; logging.getLogger(__name__).warning("Blob sync failed: %s", e)
 
 
 def _run_scrape():
@@ -96,6 +157,7 @@ def _run_scrape():
     finally:
         _scrape_state["running"] = False
         _scrape_state["last_finished"] = time.time()
+        _sync_to_blob()
 
 
 @app.get("/")
@@ -111,7 +173,17 @@ def api_listings():
 @app.get("/api/status")
 def api_status():
     listings = _load_listings()
-    mtime = LISTINGS_FILE.stat().st_mtime if LISTINGS_FILE.exists() else None
+    mtime = None
+    if _use_blob():
+        try:
+            props = (_BlobSvc.from_connection_string(AZURE_CONN)
+                     .get_blob_client(AZURE_CONTAINER, AZURE_BLOB_NAME)
+                     .get_blob_properties())
+            mtime = props.last_modified.timestamp() if props.last_modified else None
+        except Exception:
+            pass
+    elif LISTINGS_FILE.exists():
+        mtime = LISTINGS_FILE.stat().st_mtime
     return jsonify({
         "count": len(listings),
         "data_mtime": mtime,
@@ -146,6 +218,77 @@ def api_refresh():
         t = threading.Thread(target=_run_scrape, daemon=True)
         t.start()
     return jsonify({"ok": True})
+
+
+# ── Auth ────────────────────────────────────────────────────────────────────
+
+_LOGIN_HTML = """<!doctype html><html><head><title>CarLooking</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#111827">
+<link rel="manifest" href="/manifest.json">
+<style>
+  *{{box-sizing:border-box}}
+  body{{margin:0;background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;
+       display:flex;align-items:center;justify-content:center;min-height:100vh}}
+  .box{{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:32px;width:min(340px,92vw)}}
+  h2{{margin:0 0 22px;font-size:20px;display:flex;align-items:center;gap:10px}}
+  input{{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;
+        padding:11px 13px;border-radius:7px;font-size:16px;margin-bottom:14px}}
+  button{{width:100%;background:#3b82f6;color:#fff;border:none;padding:11px;
+         border-radius:7px;font-size:16px;font-weight:600;cursor:pointer}}
+  .err{{color:#f87171;font-size:13px;margin-bottom:12px}}
+</style></head>
+<body><div class="box">
+  <h2><img src="/icon.svg" width="32" height="32" style="border-radius:6px"> CarLooking</h2>
+  <form method="post">
+    <input type="password" name="pw" placeholder="Password" autofocus autocomplete="current-password">
+    {error}
+    <button>Enter</button>
+  </form>
+</div></body></html>"""
+
+_PWA_PATHS = {"/manifest.json", "/service-worker.js", "/icon.svg"}
+
+
+@app.before_request
+def _require_auth():
+    if not _PASSWORD:
+        return
+    if request.path in _PWA_PATHS or request.path == "/login":
+        return
+    if session.get("authed"):
+        return
+    return redirect("/login")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not _PASSWORD:
+        return redirect("/")
+    if request.method == "POST":
+        if request.form.get("pw") == _PASSWORD:
+            session.permanent = True
+            session["authed"] = True
+            return redirect("/")
+        return _LOGIN_HTML.format(error='<div class="err">Wrong password</div>')
+    return _LOGIN_HTML.format(error="")
+
+
+# ── Scheduler ────────────────────────────────────────────────────────────────
+
+def _start_scheduler() -> None:
+    if _SCRAPE_INTERVAL_HOURS <= 0 or not _APScheduler:
+        return
+    sched = _BgScheduler()
+    sched.add_job(
+        lambda: threading.Thread(target=_run_scrape, daemon=True).start(),
+        "interval",
+        hours=_SCRAPE_INTERVAL_HOURS,
+        id="auto_scrape",
+    )
+    sched.start()
+    import logging
+    logging.getLogger(__name__).info("Auto-scrape every %dh", _SCRAPE_INTERVAL_HOURS)
 
 
 # ── PWA assets ──────────────────────────────────────────────────────────────
@@ -848,12 +991,21 @@ if (new URLSearchParams(location.search).get('autorefresh') === '1') {
 """
 
 
+# Start scheduler when module loads (gunicorn imports this without __main__)
+_start_scheduler()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5173"))
     host = os.environ.get("HOST", "0.0.0.0")
     local_ip = _get_local_ip()
     print(f"\n  CarLooking")
     print(f"    Local:   http://127.0.0.1:{port}/")
-    print(f"    Network: http://{local_ip}:{port}/  <- open this on your phone")
-    print(f"    Tailscale: see README Android section for anywhere-access\n")
+    if not _AZURE_ENV:
+        print(f"    Network: http://{local_ip}:{port}/  <- open this on your phone")
+    if _PASSWORD:
+        print(f"    Auth:    password required")
+    if _SCRAPE_INTERVAL_HOURS:
+        print(f"    Scraper: auto-runs every {_SCRAPE_INTERVAL_HOURS}h")
+    print()
     app.run(host=host, port=port, debug=False)

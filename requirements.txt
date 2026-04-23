@@ -1,3 +1,4 @@
+gunicorn>=21.2.0               # production WSGI server (Azure App Service / Docker)
 requests>=2.31.0
 curl_cffi>=0.7.0               # Chrome TLS fingerprinting — needed to bypass Cloudflare on eBay/AutoTrader
 feedparser>=6.0.11
@@ -7,7 +8,11 @@ python-dateutil>=2.9.0
 rich>=13.7.0
 PyYAML>=6.0.1
 jinja2>=3.1.3
-flask>=3.0.0                   # local web UI — `python webapp.py`
+flask>=3.0.0
+
+# Cloud deployment (Azure App Service)
+azure-storage-blob>=12.19.0   # persistent listings storage; set AZURE_STORAGE_CONNECTION_STRING
+apscheduler>=3.10.4            # scheduled auto-scraping; set SCRAPE_INTERVAL_HOURS
 
 # Optional — only needed if you want LLM-assisted analysis
 anthropic>=0.40.0

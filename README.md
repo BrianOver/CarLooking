@@ -14,6 +14,71 @@ python webapp.py          # local UI at http://127.0.0.1:5173/
 
 That's it. The UI lets you sort by distance / price / year, filter by verdict / source / budget / mileage, and click into any listing for full details + a link to the original.
 
+## Cloud deployment (Azure App Service)
+
+Deploy to Azure so the app runs 24/7 independent of your PC. Your phone just needs a browser — no PC, no Tailscale, no local network required.
+
+### One-time setup (~15 min)
+
+**1. Create Azure resources**
+```bash
+# Install Azure CLI if needed: https://aka.ms/installazurecli
+az login
+
+# Create resource group
+az group create --name carlooking-rg --location eastus
+
+# Create storage account (for persistent listings)
+az storage account create --name carlookingdata --resource-group carlooking-rg --sku Standard_LRS
+CONN=$(az storage account show-connection-string --name carlookingdata --resource-group carlooking-rg --query connectionString -o tsv)
+
+# Create App Service plan (Free tier)
+az appservice plan create --name carlooking-plan --resource-group carlooking-rg --sku F1 --is-linux
+
+# Create the web app
+az webapp create --name carlooking --resource-group carlooking-rg --plan carlooking-plan --runtime "PYTHON:3.12"
+
+# Set startup command
+az webapp config set --name carlooking --resource-group carlooking-rg --startup-file startup.sh
+
+# Set environment variables
+az webapp config appsettings set --name carlooking --resource-group carlooking-rg --settings \
+  CARLOOKING_PASSWORD="your-password-here" \
+  SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')" \
+  AZURE_STORAGE_CONNECTION_STRING="$CONN" \
+  AZURE_BLOB_CONTAINER="carlooking" \
+  SCRAPE_INTERVAL_HOURS="12"
+```
+
+**2. Set up GitHub Actions deployment**
+1. In Azure portal → your App Service → Deployment Center → **Get publish profile** → download
+2. In GitHub repo → Settings → Secrets → New secret:
+   - `AZURE_WEBAPP_NAME` = `carlooking`
+   - `AZURE_WEBAPP_PUBLISH_PROFILE` = paste the entire publish profile XML
+3. Push to `main` — GitHub Actions deploys automatically
+
+**3. Install as Android PWA**
+1. Open Chrome on Android, go to `https://carlooking.azurewebsites.net`
+2. Log in with your password
+3. Tap 3-dot menu → **Add to Home screen** → **Install**
+
+### How it works in Azure
+
+| Feature | Behavior |
+|---|---|
+| Listings storage | Azure Blob Storage — survives restarts |
+| Auto-scrape | Every `SCRAPE_INTERVAL_HOURS` hours (default 12) |
+| Manual refresh | "Refresh data" button in the UI |
+| Auth | Password login, 30-day cookie |
+| HTTPS | Included free on `*.azurewebsites.net` — PWA service worker works |
+| Cost | Free tier (F1): $0/month for personal use |
+
+### Environment variables reference
+
+See [`.env.example`](.env.example) for all variables. Set them in Azure portal → App Service → Configuration → Application settings.
+
+---
+
 ## Android app (PWA)
 
 The web UI is installable as a full-screen home-screen app on Android — no Play Store, no APK signing, private by default.
