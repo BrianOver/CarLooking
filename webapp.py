@@ -293,7 +293,7 @@ _PWA_PATHS = {"/manifest.json", "/service-worker.js", "/icon.svg"}
 def _require_auth():
     if not _PASSWORD:
         return
-    if request.path in _PWA_PATHS or request.path in ("/login", "/change-password"):
+    if request.path in _PWA_PATHS or request.path in ("/login", "/change-password", "/api/upload-listings"):
         return
     if session.get("authed"):
         return

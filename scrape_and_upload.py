@@ -2,14 +2,15 @@
 Run on your PC (residential IP) — scrapes all sources, then uploads to Azure.
 
 Usage:
-    python scrape_and_upload.py
+    python scrape_and_upload.py              # scrape + upload
+    python scrape_and_upload.py --upload-only  # upload existing output/listings.json
 
-Reads CARLOOKING_UPLOAD_URL and CARLOOKING_UPLOAD_TOKEN from environment
-or from a local .env file (never committed).
+Reads CARLOOKING_UPLOAD_URL and CARLOOKING_UPLOAD_TOKEN from .env file (never committed).
 
-Set these once:
-    Windows:  setx CARLOOKING_UPLOAD_URL "https://carlooking.azurewebsites.net"
-              setx CARLOOKING_UPLOAD_TOKEN "your-token-here"
+Schedule every 12h with Windows Task Scheduler:
+    Action: C:\\Code\\CarLooking\\.venv\\Scripts\\pythonw.exe
+    Arguments: C:\\Code\\CarLooking\\scrape_and_upload.py
+    Start in: C:\\Code\\CarLooking
 """
 from __future__ import annotations
 
@@ -93,7 +94,11 @@ def upload() -> bool:
 
 
 if __name__ == "__main__":
-    ok = scrape()
-    if ok:
-        upload()
+    upload_only = "--upload-only" in sys.argv
+    if upload_only:
+        ok = upload()
+    else:
+        ok = scrape()
+        if ok:
+            upload()
     sys.exit(0 if ok else 1)
