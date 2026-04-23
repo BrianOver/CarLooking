@@ -22,7 +22,8 @@ class Listing:
     images: list[str] = field(default_factory=list)
     posted_at: Optional[str] = None
     raw_id: Optional[str] = None
-    auction_ends: Optional[str] = None   # ISO datetime string; populated for BaT/auction listings
+    auction_ends: Optional[str] = None        # ISO datetime string; populated for BaT/auction listings
+    shipping_estimate_usd: Optional[int] = None  # None = not applicable / local; 0 = in TX; >0 = est. transport cost
 
     # Populated by analyzer
     score: Optional[float] = None

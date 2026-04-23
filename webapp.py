@@ -557,6 +557,7 @@ function render() {
         <div class="prices">
           <div class="box"><span class="label">${priceTypeLabel(l.price_type)}</span><span class="value">${money(l.price)}${priceTypeBadge(l.price_type)}</span></div>
           <div class="box"><span class="label">A/C work</span><span class="value">${l.ac_estimate_usd == null ? "—" : (l.ac_estimate_usd === 0 ? "Works" : money(l.ac_estimate_usd))}</span></div>
+          ${l.shipping_estimate_usd != null ? `<div class="box"><span class="label">Shipping</span><span class="value">${l.shipping_estimate_usd === 0 ? '<span style="color:var(--green)">In TX</span>' : money(l.shipping_estimate_usd)}</span></div>` : ""}
           <div class="box"><span class="label">All-in</span><span class="value">${money(l.all_in_price)}</span></div>
         </div>
       </div>`;
@@ -583,7 +584,8 @@ function openModal(l) {
     <div class="grid2">
       <div class="item"><span class="k">${priceTypeLabel(l.price_type)}</span><span class="v">${money(l.price)}${priceTypeBadge(l.price_type)}</span></div>
       <div class="item"><span class="k">A/C retrofit</span><span class="v">${l.ac_estimate_usd == null ? "—" : (l.ac_estimate_usd === 0 ? "Works as-listed" : money(l.ac_estimate_usd))}</span></div>
-      <div class="item"><span class="k">All-in</span><span class="v">${money(l.all_in_price)}</span></div>
+      <div class="item"><span class="k">All-in (price+A/C+ship)</span><span class="v">${money(l.all_in_price)}</span></div>
+      ${l.shipping_estimate_usd != null ? `<div class="item"><span class="k">Est. Shipping</span><span class="v">${l.shipping_estimate_usd === 0 ? "In Texas ($0)" : money(l.shipping_estimate_usd)}</span></div>` : ""}
       <div class="item"><span class="k">Year / Make / Model</span><span class="v">${[l.year, l.make, l.model].filter(Boolean).join(" ") || "—"}</span></div>
       <div class="item"><span class="k">Mileage</span><span class="v">${num(l.mileage)}</span></div>
       <div class="item"><span class="k">Transmission</span><span class="v">${escapeHTML(l.transmission || "—")}</span></div>

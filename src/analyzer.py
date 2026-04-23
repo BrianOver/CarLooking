@@ -203,12 +203,19 @@ def score_listing(
             when = f"in ~{int(hours_left/24)}d" if hours_left else "date unknown"
             concerns.append(f"Active bid ({when}) — expect final price to be higher")
 
-    # --- All-in price
+    # --- Shipping
+    ship = listing.shipping_estimate_usd
+    if ship is not None and ship > 0:
+        concerns.append(f"Est. transport ~${ship:,} (not in TX)")
+    elif ship == 0:
+        benefits.append("In Texas — no shipping needed")
+
+    # --- All-in price  (price + A/C + shipping)
     if price is not None:
-        listing.all_in_price = price + (ac_cost or 0)
+        listing.all_in_price = price + (ac_cost or 0) + (ship or 0)
         if listing.all_in_price > max_price * 1.1:
             concerns.append(
-                f"All-in (price + A/C) ${listing.all_in_price:,} exceeds budget headroom"
+                f"All-in (price + A/C + shipping) ${listing.all_in_price:,} exceeds budget headroom"
             )
             score -= 10
 

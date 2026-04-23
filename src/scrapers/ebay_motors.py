@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
+from typing import Optional  # noqa: F401 — used in type hints below
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
@@ -36,8 +36,38 @@ log = logging.getLogger(__name__)
 
 BASE = "https://www.ebay.com/sch/6001/i.html"
 
+# States adjacent to or very close to Texas — drive/trailer feasible or cheap transport
+_NEAR_STATES = {"TX", "LA", "AR", "OK", "NM", "MS", "TN", "KS", "CO", "MO", "AL"}
+
+_STATE_RE = re.compile(r'\b([A-Z]{2})\s*$')
+
+
+def _shipping_for_location(location: Optional[str]) -> int:
+    """Return flat-rate shipping estimate based on seller state.
+    TX=0, adjacent/near states=1500, everywhere else=2000."""
+    if not location:
+        return 2000
+    m = _STATE_RE.search(location.upper().strip())
+    if not m:
+        # Try to match full state name
+        loc_up = location.upper()
+        if "TEXAS" in loc_up:
+            return 0
+        if any(s in loc_up for s in ("LOUISIANA", "ARKANSAS", "OKLAHOMA", "NEW MEXICO",
+                                      "MISSISSIPPI", "TENNESSEE", "KANSAS", "COLORADO", "MISSOURI", "ALABAMA")):
+            return 1500
+        return 2000
+    state = m.group(1)
+    if state == "TX":
+        return 0
+    if state in _NEAR_STATES:
+        return 1500
+    return 2000
+
 
 def _build_url(criteria: dict, query: str, page: int = 1) -> str:
+    # Keep _stpos so eBay renders a full results page; omit _sadis for nationwide results.
+    # Shipping cost is estimated per-listing from the seller's state.
     params = [
         ("_from", "R40"),
         ("_nkw", query),
@@ -45,9 +75,8 @@ def _build_url(criteria: dict, query: str, page: int = 1) -> str:
         ("_udhi", criteria.get("max_price", 23000)),
         ("_udlo", criteria.get("min_price", 2000)),
         ("Transmission", "Manual"),
-        ("_stpos", criteria.get("zip_code", "75048")),
-        ("_sadis", criteria.get("radius_miles", 200)),
-        ("LH_PrefLoc", "1"),
+        ("_stpos", criteria.get("zip_code", "75048")),  # needed for eBay to render results
+        ("LH_PrefLoc", "1"),   # US domestic only
         ("_pgn", page),
         ("_ipg", "60"),
     ]
@@ -143,6 +172,7 @@ def _parse_listings(html: str) -> list[Listing]:
             location=location,
             images=images,
             raw_id=raw_id,
+            shipping_estimate_usd=_shipping_for_location(location),
         ))
 
     return out
