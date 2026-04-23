@@ -17,6 +17,7 @@ from __future__ import annotations
 import collections
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -25,6 +26,17 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, render_template_string, request
+
+
+def _get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "unknown"
 
 ROOT = Path(__file__).parent
 LISTINGS_FILE = ROOT / "output" / "listings.json"
@@ -136,12 +148,114 @@ def api_refresh():
     return jsonify({"ok": True})
 
 
+# ── PWA assets ──────────────────────────────────────────────────────────────
+
+@app.get("/manifest.json")
+def pwa_manifest():
+    return Response(json.dumps({
+        "name": "CarLooking",
+        "short_name": "CarLooking",
+        "description": "Manual weekend car finder",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0f172a",
+        "theme_color": "#111827",
+        "orientation": "any",
+        "icons": [
+            {"src": "/icon.svg", "type": "image/svg+xml", "sizes": "any", "purpose": "any maskable"},
+        ],
+        "shortcuts": [
+            {"name": "Refresh listings", "url": "/?autorefresh=1", "description": "Scrape fresh data"},
+        ],
+    }), mimetype="application/manifest+json")
+
+
+_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="90" fill="#0f172a"/>
+  <rect x="70" y="295" width="372" height="95" rx="18" fill="#2563eb"/>
+  <path d="M130 295 L178 188 L334 188 L382 295 Z" fill="#3b82f6"/>
+  <path d="M185 292 L213 206 L299 206 L327 292 Z" fill="#0f172a" opacity="0.45"/>
+  <circle cx="168" cy="392" r="46" fill="#1e293b"/>
+  <circle cx="168" cy="392" r="26" fill="#334155"/>
+  <circle cx="168" cy="392" r="10" fill="#60a5fa"/>
+  <circle cx="344" cy="392" r="46" fill="#1e293b"/>
+  <circle cx="344" cy="392" r="26" fill="#334155"/>
+  <circle cx="344" cy="392" r="10" fill="#60a5fa"/>
+  <rect x="72" y="312" width="38" height="18" rx="5" fill="#fbbf24"/>
+  <rect x="402" y="312" width="38" height="18" rx="5" fill="#ef4444"/>
+</svg>"""
+
+
+@app.get("/icon.svg")
+def pwa_icon():
+    return Response(_ICON_SVG, mimetype="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=604800"})
+
+
+_SERVICE_WORKER_JS = r"""
+const CACHE = 'carlooking-v2';
+
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.add('/')));
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys().then(ks =>
+      Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', e => {
+  const url = new URL(e.request.url);
+  if (url.pathname === '/api/refresh' || url.pathname === '/api/refresh/log') return;
+
+  if (url.pathname.startsWith('/api/')) {
+    // Network-first for data: try live, fall back to cache
+    e.respondWith(
+      fetch(e.request).then(r => {
+        if (r.ok) caches.open(CACHE).then(c => c.put(e.request, r.clone()));
+        return r;
+      }).catch(() => caches.match(e.request))
+    );
+    return;
+  }
+
+  // Cache-first for app shell
+  e.respondWith(
+    caches.match(e.request).then(cached => cached ||
+      fetch(e.request).then(r => {
+        if (r.ok) caches.open(CACHE).then(c => c.put(e.request, r.clone()));
+        return r;
+      })
+    )
+  );
+});
+"""
+
+
+@app.get("/service-worker.js")
+def service_worker():
+    return Response(_SERVICE_WORKER_JS, mimetype="application/javascript",
+                    headers={"Cache-Control": "no-cache"})
+
+
 TEMPLATE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CarLooking</title>
+<meta name="theme-color" content="#111827">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="CarLooking">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon.svg">
 <style>
   :root {
     --bg: #0f172a; --panel: #1e293b; --panel-2: #111827; --border: #334155;
@@ -717,6 +831,17 @@ function auctionEndsHtml(l) {
 }
 
 load();
+
+// PWA: register service worker (activates fully on HTTPS; silently skipped on HTTP)
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/service-worker.js').catch(() => {});
+}
+
+// PWA shortcut: ?autorefresh=1 triggers a fresh scrape on launch
+if (new URLSearchParams(location.search).get('autorefresh') === '1') {
+  history.replaceState(null, '', '/');
+  startRefresh();
+}
 </script>
 </body>
 </html>
@@ -725,5 +850,10 @@ load();
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5173"))
-    print(f"\n  CarLooking web UI -> http://127.0.0.1:{port}/\n")
-    app.run(host="127.0.0.1", port=port, debug=False)
+    host = os.environ.get("HOST", "0.0.0.0")
+    local_ip = _get_local_ip()
+    print(f"\n  CarLooking")
+    print(f"    Local:   http://127.0.0.1:{port}/")
+    print(f"    Network: http://{local_ip}:{port}/  <- open this on your phone")
+    print(f"    Tailscale: see README Android section for anywhere-access\n")
+    app.run(host=host, port=port, debug=False)

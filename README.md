@@ -14,6 +14,49 @@ python webapp.py          # local UI at http://127.0.0.1:5173/
 
 That's it. The UI lets you sort by distance / price / year, filter by verdict / source / budget / mileage, and click into any listing for full details + a link to the original.
 
+## Android app (PWA)
+
+The web UI is installable as a full-screen home-screen app on Android — no Play Store, no APK signing, private by default.
+
+### Option A — Home WiFi only (simplest)
+
+1. Start the webapp: double-click `start.bat`
+2. Note the **Network:** URL printed in the console (e.g. `http://192.168.1.42:5173/`)
+3. On Android, open **Chrome** and navigate to that URL
+4. Tap the 3-dot menu → **Add to Home screen** → **Install**
+5. CarLooking appears as a full-screen app on your home screen
+
+### Option B — Anywhere access via Tailscale (recommended)
+
+Tailscale creates a private encrypted network between your PC and phone — works on any network, no port forwarding needed.
+
+1. Install [Tailscale](https://tailscale.com) on your Windows PC and sign in
+2. Install [Tailscale](https://play.google.com/store/apps/details?id=com.tailscale.ipn.android) on your Android phone and sign in with the **same account**
+3. Find your PC's Tailscale IP: open Tailscale on PC → it shows something like `100.x.x.x`
+4. Start the webapp on the PC: `start.bat` (or `start_silent.vbs` for no console)
+5. On Android Chrome, navigate to `http://100.x.x.x:5173/`
+6. Install as PWA (same as Option A step 4–5)
+
+For full offline caching (optional), enable HTTPS via Tailscale:
+```
+tailscale cert <your-machine-name>.ts.net
+```
+Then launch with: `CERT=.ts.net.crt KEY=.ts.net.key python webapp.py` — the service worker at `/service-worker.js` will activate and cache listings for offline viewing.
+
+### Auto-start with Windows
+
+So CarLooking is always running when your PC is on:
+
+1. Press `Win+R`, type `shell:startup`, press Enter
+2. Copy `start_silent.vbs` into that folder
+3. CarLooking will start silently on every boot; access it from your phone at any time
+
+To stop it: Task Manager → find `pythonw.exe` → End Task.
+
+### PWA shortcut: "Refresh listings"
+
+The installed Android app has a **long-press shortcut** named "Refresh listings" — long-press the home screen icon and tap it to immediately kick off a fresh scrape.
+
 ## Sources
 
 Tested against live sites, DFW radius, manual filter:
