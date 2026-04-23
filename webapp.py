@@ -254,11 +254,78 @@ _PWA_PATHS = {"/manifest.json", "/service-worker.js", "/icon.svg"}
 def _require_auth():
     if not _PASSWORD:
         return
-    if request.path in _PWA_PATHS or request.path == "/login":
+    if request.path in _PWA_PATHS or request.path in ("/login", "/change-password"):
         return
     if session.get("authed"):
         return
     return redirect("/login")
+
+
+_PW_OVERRIDE_FILE = Path("/home/carlooking-pw.txt") if _AZURE_ENV else ROOT / "carlooking-pw.txt"
+
+
+def _get_password() -> str:
+    """Read password: file override first (allows in-app change), then env var."""
+    try:
+        if _PW_OVERRIDE_FILE.exists():
+            return _PW_OVERRIDE_FILE.read_text().strip()
+    except Exception:
+        pass
+    return _PASSWORD
+
+
+_CHANGE_PW_HTML = """<!doctype html><html><head><title>Change Password — CarLooking</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#111827">
+<style>
+  *{{box-sizing:border-box}} body{{margin:0;background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;
+  display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}}
+  .box{{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:28px;width:min(360px,100%)}}
+  h2{{margin:0 0 20px;font-size:18px}} label{{font-size:13px;color:#94a3b8;display:block;margin-bottom:4px}}
+  input{{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:10px 12px;
+        border-radius:7px;font-size:16px;margin-bottom:14px}}
+  button{{width:100%;background:#3b82f6;color:#fff;border:none;padding:11px;border-radius:7px;
+         font-size:16px;font-weight:600;cursor:pointer;margin-bottom:10px}}
+  .cancel{{background:#1e293b;border:1px solid #334155;color:#e2e8f0}}
+  .err{{color:#f87171;font-size:13px;margin-bottom:12px}}
+  .ok{{color:#22c55e;font-size:13px;margin-bottom:12px}}
+</style></head><body><div class="box">
+  <h2>Change password</h2>
+  <form method="post">
+    <label>Current password</label>
+    <input type="password" name="current" autofocus autocomplete="current-password">
+    <label>New password</label>
+    <input type="password" name="new1" autocomplete="new-password">
+    <label>Confirm new password</label>
+    <input type="password" name="new2" autocomplete="new-password">
+    {msg}
+    <button type="submit">Save</button>
+  </form>
+  <a href="/"><button class="cancel" type="button">Cancel</button></a>
+</div></body></html>"""
+
+
+@app.route("/change-password", methods=["GET", "POST"])
+def change_password():
+    if _PASSWORD and not session.get("authed"):
+        return redirect("/login")
+    if request.method == "POST":
+        current = request.form.get("current", "")
+        new1 = request.form.get("new1", "")
+        new2 = request.form.get("new2", "")
+        if current != _get_password():
+            return _CHANGE_PW_HTML.format(msg='<div class="err">Current password is wrong</div>')
+        if len(new1) < 8:
+            return _CHANGE_PW_HTML.format(msg='<div class="err">New password must be 8+ characters</div>')
+        if new1 != new2:
+            return _CHANGE_PW_HTML.format(msg='<div class="err">Passwords don\'t match</div>')
+        try:
+            _PW_OVERRIDE_FILE.write_text(new1)
+        except Exception as e:
+            return _CHANGE_PW_HTML.format(msg=f'<div class="err">Save failed: {e}</div>')
+        session["authed"] = True
+        return _CHANGE_PW_HTML.format(msg='<div class="ok">Password changed. <a href="/">Back to app</a></div>')
+    return _CHANGE_PW_HTML.format(msg="")
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -266,7 +333,7 @@ def login():
     if not _PASSWORD:
         return redirect("/")
     if request.method == "POST":
-        if request.form.get("pw") == _PASSWORD:
+        if request.form.get("pw") == _get_password():
             session.permanent = True
             session["authed"] = True
             return redirect("/")
@@ -429,6 +496,8 @@ TEMPLATE = r"""<!doctype html>
   }
   header button:disabled { opacity: 0.5; cursor: not-allowed; }
   header button.secondary { background: var(--panel); border: 1px solid var(--border); color: var(--text); }
+  .filter-btn { display: none; }
+  .filter-close-btn { display: none; }
 
   .layout { display: grid; grid-template-columns: 260px 1fr; min-height: calc(100vh - 58px); }
   aside.filters {
@@ -543,6 +612,54 @@ TEMPLATE = r"""<!doctype html>
 
   .empty { color: var(--muted); text-align: center; padding: 60px 20px; font-size: 14px; }
 
+  /* ── Mobile ─────────────────────────────────────────────────────────────── */
+  @media (max-width: 640px) {
+    header { padding: 10px 14px; gap: 8px; }
+    header h1 { font-size: 16px; }
+    header .stats { order: 10; width: 100%; margin-right: 0; font-size: 11px; }
+    header input[type=search] { min-width: unset; flex: 1; font-size: 16px; }
+    header select { flex: 1; font-size: 16px; }
+    header button { padding: 8px 12px; font-size: 13px; }
+    .filter-btn { display: inline-flex !important; }
+
+    .layout { grid-template-columns: 1fr; }
+    aside.filters {
+      position: fixed; top: 0; left: 0; bottom: 0; width: min(300px, 88vw);
+      z-index: 60; border-right: 1px solid var(--border);
+      transform: translateX(-105%); transition: transform 0.22s ease;
+      padding-top: 54px; max-height: 100vh;
+    }
+    aside.filters.open { transform: translateX(0); box-shadow: 4px 0 24px rgba(0,0,0,0.5); }
+    .filter-close-btn {
+      display: flex !important; position: absolute; top: 12px; right: 12px;
+      background: none; border: none; color: var(--muted); font-size: 22px;
+      cursor: pointer; padding: 4px;
+    }
+    .filter-backdrop {
+      display: none; position: fixed; inset: 0; z-index: 59;
+      background: rgba(0,0,0,0.55); backdrop-filter: blur(2px);
+    }
+    .filter-backdrop.open { display: block; }
+
+    main { padding: 10px 12px; }
+    .grid { grid-template-columns: 1fr; gap: 10px; }
+    .card-img, .card-img-placeholder { height: 180px; }
+
+    .modal-bg { align-items: flex-end; padding: 0; }
+    .modal {
+      border-radius: 18px 18px 0 0; max-width: 100%; width: 100%;
+      max-height: 88vh; padding: 18px 16px 28px;
+    }
+    .modal h2 { font-size: 16px; }
+    .modal .grid2 { grid-template-columns: 1fr; gap: 10px 0; }
+    .modal-gallery img { height: 160px; }
+
+    .progress-panel { width: calc(100vw - 24px); right: 12px; bottom: 12px; max-height: 50vh; }
+
+    .prices { gap: 8px; }
+    .prices .value { font-size: 13px; }
+  }
+
   /* Scrape progress panel */
   .progress-panel {
     display: none; position: fixed; bottom: 20px; right: 20px; z-index: 200;
@@ -583,6 +700,7 @@ TEMPLATE = r"""<!doctype html>
 <header>
   <h1>CarLooking</h1>
   <div class="stats" id="stats">Loading…</div>
+  <button class="secondary filter-btn" id="filterToggle" onclick="toggleFilters()">⚙ Filters</button>
   <input type="search" id="q" placeholder="Search title, model, location…">
   <select id="sort">
     <option value="score">Best match</option>
@@ -596,10 +714,13 @@ TEMPLATE = r"""<!doctype html>
   </select>
   <button id="refresh">Refresh data</button>
   <button id="reload" class="secondary">Reload</button>
+  <a href="/change-password" style="color:var(--muted);font-size:18px;text-decoration:none" title="Change password">⚙</a>
 </header>
 
+<div class="filter-backdrop" id="filterBackdrop" onclick="toggleFilters()"></div>
 <div class="layout">
-  <aside class="filters">
+  <aside class="filters" id="filterPanel">
+  <button class="filter-close-btn" onclick="toggleFilters()">✕</button>
     <h3>Verdict</h3>
     <div id="verdicts"></div>
 
@@ -953,6 +1074,11 @@ async function startRefresh() {
     spinner.style.display = "none";
     title.textContent = "Scrape error — check log";
   };
+}
+
+function toggleFilters() {
+  document.getElementById('filterPanel').classList.toggle('open');
+  document.getElementById('filterBackdrop').classList.toggle('open');
 }
 
 function escapeHTML(s) {
