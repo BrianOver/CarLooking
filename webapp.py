@@ -67,7 +67,8 @@ DB_PATH = _DATA_DIR / "carlooking.db"
 
 
 def _init_db() -> None:
-    with sqlite3.connect(str(DB_PATH)) as c:
+    with sqlite3.connect(str(DB_PATH), timeout=30) as c:
+        c.execute("PRAGMA journal_mode=DELETE")
         c.execute("""CREATE TABLE IF NOT EXISTS listings (
             url TEXT PRIMARY KEY,
             data TEXT NOT NULL,
@@ -98,19 +99,28 @@ def _load_listings() -> list[dict]:
     return []
 
 
-def _save_to_db(listings: list[dict]) -> None:
+def _save_to_db(listings: list[dict]) -> int:
+    """Save listings to SQLite. Returns verified count. Raises on failure."""
+    with sqlite3.connect(str(DB_PATH), timeout=30) as c:
+        c.execute("PRAGMA journal_mode=DELETE")   # WAL has issues on Azure Files
+        c.execute("PRAGMA synchronous=FULL")
+        c.execute("DELETE FROM listings")
+        c.executemany(
+            "INSERT OR REPLACE INTO listings (url, data) VALUES (?, ?)",
+            [(l.get("url", str(i)), json.dumps(l, ensure_ascii=False))
+             for i, l in enumerate(listings)]
+        )
+        c.execute("INSERT OR REPLACE INTO meta VALUES ('last_scraped', ?)", [str(time.time())])
+        count = c.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+    _log.info("Saved %d listings to SQLite (verified %d)", len(listings), count)
+    # Also write JSON to /home as fallback
     try:
-        with sqlite3.connect(str(DB_PATH)) as c:
-            c.execute("DELETE FROM listings")
-            c.executemany(
-                "INSERT OR REPLACE INTO listings (url, data) VALUES (?, ?)",
-                [(l.get("url", str(i)), json.dumps(l, ensure_ascii=False))
-                 for i, l in enumerate(listings)]
-            )
-            c.execute("INSERT OR REPLACE INTO meta VALUES ('last_scraped', ?)", [str(time.time())])
-        _log.info("Saved %d listings to SQLite", len(listings))
+        tmp = LISTINGS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(listings, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(LISTINGS_FILE)
     except Exception as e:
-        _log.warning("DB write: %s", e)
+        _log.warning("JSON fallback write: %s", e)
+    return count
 
 
 def _db_mtime() -> float | None:
@@ -241,9 +251,13 @@ def api_upload_listings():
     data = request.get_json(force=True, silent=True)
     if not isinstance(data, list):
         return jsonify({"error": "expected JSON array"}), 400
-    _save_to_db(data)
-    _log.info("Uploaded %d listings from PC", len(data))
-    return jsonify({"ok": True, "count": len(data)})
+    try:
+        count = _save_to_db(data)
+    except Exception as e:
+        _log.error("Upload save failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    _log.info("Uploaded %d listings from PC, verified %d in DB", len(data), count)
+    return jsonify({"ok": True, "count": count})
 
 
 @app.get("/api/log")
