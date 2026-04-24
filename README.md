@@ -4,6 +4,52 @@ Scrapes public used-car listings for **manual weekend cars** near Sachse, TX and
 
 Comes with a **local web UI** for filtering, sorting, and browsing the results — see [Web UI](#web-ui) below.
 
+## TODO — fix before next Azure deploy
+
+**GitHub Actions "Deploy to Azure" is currently failing** on every push. Last 2 runs failed in <15s with:
+
+```
+Login failed: Using auth-type: SERVICE_PRINCIPAL. Not all values are present.
+Ensure 'client-id' and 'tenant-id' are supplied.
+```
+
+This is a secrets-config issue only — the code is fine and is already sitting on `main`. Azure App Service is still running the last successfully-deployed commit.
+
+### Fix steps (~5 min)
+
+```bash
+# 1. Get your Azure subscription ID
+az account show --query id -o tsv
+
+# 2. Create a service principal scoped to the CarLooking resource group
+az ad sp create-for-rbac \
+  --name carlooking-github \
+  --role contributor \
+  --scopes /subscriptions/<YOUR_SUB_ID_FROM_STEP_1>/resourceGroups/carlooking-rg \
+  --sdk-auth
+```
+
+The command prints a JSON blob like `{ "clientId": "...", "clientSecret": "...", "tenantId": "...", "subscriptionId": "...", ... }`.
+
+3. In the GitHub repo, go to **Settings → Secrets and variables → Actions → New repository secret**
+4. Create/update secret named exactly `AZURE_CREDENTIALS` — paste the **entire JSON blob** as the value (including the surrounding braces)
+5. Confirm `AZURE_WEBAPP_NAME` secret exists and equals `carlooking`
+6. Re-run the failed workflow from the Actions tab — should succeed in ~2 min
+
+### Why it broke
+
+The current `AZURE_CREDENTIALS` secret was probably stored as just the client-secret string or a partial publish-profile XML. `azure/login@v2` with `auth-type: SERVICE_PRINCIPAL` requires the full SP JSON schema from `az ad sp create-for-rbac --sdk-auth`.
+
+### Verification after fix
+
+```bash
+gh run list --workflow=deploy-azure.yml --limit 1    # should show "completed success"
+curl -s -o /dev/null -w "%{http_code}\n" https://carlooking.azurewebsites.net/
+# expect 200 (or 302 to /login if auth is enabled)
+```
+
+---
+
 ## Quick start
 
 ```bash
