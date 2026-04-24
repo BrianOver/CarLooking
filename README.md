@@ -128,20 +128,35 @@ Tested against live sites, DFW radius, manual filter:
 
 | Source | Status | Notes |
 |---|---|---|
-| Craigslist (DFW + 200mi radius) | ✅ reliable | Parses JSON-LD on the search page (RSS feeds were deprecated by CL). Yields ~30–50 real listings per run. |
-| eBay Motors | ✅ reliable | Public search HTML. Yields ~15–40 per run. Limits to manual + within radius server-side. |
-| Bring a Trailer | ✅ reliable | Scrapes the bootstrap JSON on `/auctions/`. Nationwide, filtered client-side against your target model list. |
+| Craigslist (12 regional sites) | ✅ reliable | Parses JSON-LD on the search page (RSS feeds were deprecated by CL). Covers DFW + East TX + Waco + Texoma + Shreveport + Lawton + OKC + Austin + Houston + Abilene + Tulsa + San Marcos. Yields ~30–70 real listings per run. |
+| eBay Motors | ✅ reliable | Public search HTML. Yields ~15–40 per run. Limits to manual + within radius server-side. Per-listing shipping estimate based on seller state. |
+| Bring a Trailer | ✅ reliable | Scrapes the bootstrap JSON on `/auctions/`. Nationwide, filtered client-side against your target model list. Fetches detail pages for seller city/state + auction end time. |
 | AutoTrader | ⚠️ best-effort | Works on the first request; aggressive anti-bot then rate-limits us. For better yields use Playwright (not wired in by default). |
+| Cars & Bids | ⚠️ best-effort | Anon HTML + __NEXT_DATA__ parser — yields vary; some days you get ~10 matches, others zero. |
 | ClassicCars.com | ⚠️ opt-in | Off by default. Their search/price filters don't actually filter — most listings are $40K+ muscle cars. Occasionally surfaces a sub-$23K Datsun/VW. Enable if you stretch budget. |
 | Hemmings | ⚠️ opt-in | Off by default. Cloudflare JS challenge blocks the search-page URL discovery; detail pages work but we can't reach them without JS. |
-| Cars.com | ⚠️ best-effort | Page is client-side-rendered — the SSR response has the shell but not listings. Useful only with Playwright. |
-| Cars & Bids | ⚠️ best-effort | Heavy SPA, anon response is minimal. Playwright required for real data. |
-| Facebook Marketplace | ❌ off by default | Against Meta ToS; needs persistent logged-in Playwright session; UI changes break it often. |
-| CarGurus | ❌ off by default | Cloudflare-gated. Needs Playwright. |
+| Facebook Marketplace | ⚠️ anon mode only | Low yield without a logged-in Playwright session; Meta ToS means personal use only, do not redistribute. |
+| Carvana | ❌ SPA-gated | Scraper code exists but Carvana's SSR only returns recommendation carousels, not actual filtered inventory. Real listings are JS-loaded via their API — needs Playwright. |
+| Cars.com | ❌ SPA-gated | Page is client-side-rendered — SSR has shell but not listings. Needs Playwright. |
+| CarMax | ❌ SPA-gated | Tested: even their `/api/search/run` endpoint returns HTML wrapper. Needs Playwright. |
+| Hagerty Marketplace | ❌ SPA-gated | Uses urql/GraphQL client-side hydration. Listings never appear in SSR. Needs Playwright. |
+| CarGurus | ❌ Cloudflare-gated | Blocked even with `curl_cffi` TLS impersonation. Needs Playwright. |
+| TrueCar / KBB / AutoHunter / Mecum | ❌ SPA or blocked | Tested, none return real listing data in SSR. |
 
 Each scraper is isolated — if one 403s or breaks, the rest still work. Enable only what you want via `sources:` in `config.yaml`.
 
-Primary reliable yield comes from **Craigslist + eBay Motors + Bring a Trailer** — that combo already surfaces 50–100+ real manual-transmission listings per run across the DFW area and nationwide auctions.
+Primary reliable yield comes from **Craigslist + eBay Motors + Bring a Trailer** — that combo already surfaces 80–150+ real manual-transmission listings per run across the broader TX/OK area and nationwide auctions.
+
+### Why so many sites are "SPA-gated"
+
+Most modern car-selling platforms (Carvana, CarMax, Cars.com, CarGurus, TrueCar, Hagerty, AutoHunter) render listings client-side via React/Next.js + GraphQL. The initial HTML response is just a shell; real listing data only appears after JavaScript executes and makes authenticated XHR calls to their internal APIs. Pure HTTP scraping can't see it.
+
+To scrape any of these you'd need to:
+1. Install Playwright: `pip install playwright && playwright install chromium`
+2. Refactor the `base.make_session()` helper to return a Playwright browser context
+3. In each scraper, `page.goto(url)` and wait for the listings to render before parsing
+
+The `carvana.py` scraper is structured for this — the `_parse_ld_vehicles()` and `_normalize()` helpers would work unchanged once the page has been JS-rendered.
 
 ## Install
 

@@ -113,6 +113,7 @@ sources:
   craigslist: true              # reliable
   ebay_motors: true             # reliable
   bring_a_trailer: true         # reliable
+  carvana: false                # off — SSR only returns recommendation carousels; real inventory is JS-loaded, needs Playwright
   classiccars: false            # off — most listings >$25K; low signal for weekend-car budget. Enable if you stretch to ~$40K.
   hemmings: false               # off — Cloudflare JS challenge on search page blocks URL discovery.
   autotrader: true              # best-effort (anti-bot rate limits)

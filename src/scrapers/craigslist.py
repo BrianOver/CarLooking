@@ -31,9 +31,21 @@ from .base import (
 
 log = logging.getLogger(__name__)
 
-# Craigslist subdomains within ~200mi of Sachse, TX
+# Craigslist subdomains within ~200mi of Sachse, TX (with Austin + Houston
+# slightly past the radius — drive-feasible for the right car).
 CL_SITES = [
-    "dallas", "easttexas", "waco", "texoma", "shreveport", "lawton", "oklahomacity",
+    "dallas",        # DFW itself
+    "easttexas",     # Tyler, Longview
+    "waco",          # Waco, Temple
+    "texoma",        # Sherman-Denison
+    "shreveport",    # Shreveport LA
+    "lawton",        # Lawton OK
+    "oklahomacity",  # OKC
+    "austin",        # Austin — ~200mi, drive-feasible
+    "houston",       # Houston — ~240mi, trailer-feasible
+    "abilene",       # Abilene — ~180mi W
+    "tulsa",         # Tulsa — ~240mi N (post-oklahomacity for overlap dedup)
+    "sanmarcos",     # San Marcos — ~215mi S (between Austin + SATX)
 ]
 
 # Sachse, TX
